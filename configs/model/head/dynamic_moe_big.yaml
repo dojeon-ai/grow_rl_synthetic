@@ -1,0 +1,10 @@
+type: big_dynamic_moe
+initial_experts: 1
+max_experts: ${num_tasks}
+grow_increment: 1
+in_shape: null
+output_size: ${dataset.output_size}
+norm_type: none
+activ_type: relu
+drop_prob: 0.0
+hidden_dims: [1024, 1024]

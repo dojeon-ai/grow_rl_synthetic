@@ -1,0 +1,14 @@
+type: dynamic_moe
+expert_type: linear
+initial_experts: 1
+max_experts: ${num_tasks}
+grow_increment: 1
+output_max_k: 1e+10
+grad_max_k: 1e+10
+bottleneck_match_active_param: False
+in_shape: null
+output_size: ${dataset.output_size}
+norm_type: none
+activ_type: relu
+drop_prob: 0.0
+hidden_dims: [1024, 1024]

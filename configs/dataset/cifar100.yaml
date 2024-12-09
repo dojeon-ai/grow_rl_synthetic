@@ -7,7 +7,7 @@ label_noise_ratios: ${label_noise_ratios}
 buffer_size: 50000
 
 train:
-  root: '/home/hojoonlee/assets/CIFAR100/train' 
+  root: '/home/donghukim/assets/CIFAR100/train' 
   transforms:
     crop_type: 'none' # [none, center, random_resize, random_pad]
     scale: null
@@ -21,7 +21,7 @@ train:
   shuffle: true
 
 test:
-  root: '/home/hojoonlee/assets/CIFAR100/val' 
+  root: '/home/donghukim/assets/CIFAR100/val' 
   transforms:
     crop_type: 'none' # [center, random, none]
     scale: null

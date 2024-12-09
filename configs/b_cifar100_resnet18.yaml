@@ -12,8 +12,8 @@ dataset:
       horizontal_flip: true
 
 defaults:
-- _continual
-- dataset: cifar10
-- model: resnet18_gap
+- _base
+- dataset: cifar100
+- model: resnet18_mlp
 - trainer: base
 - _self_

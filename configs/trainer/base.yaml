@@ -11,7 +11,7 @@ use_amp: True
 
 ################
 # train
-base_epochs: 100
+train_steps_per_task: 50000
 clip_grad_norm: 0.5
 
 optimizer_type: 'adamw'
@@ -57,10 +57,13 @@ reinit:
 redo:
   lmbda: 0.0
 
+aux_lmbda: 0.0
+
 ################ 
 # evaluation
 log_every: 1000       # per_step
-base_test_every: 5    # per_epoch
+test_every: 5000      # per_step
+intervene_every: ${trainer.train_steps_per_task}      # per_step
 analysis_samples: 512
 
 # hessian anlysis (time consuming)

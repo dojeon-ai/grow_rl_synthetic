@@ -44,6 +44,10 @@ class MLPHead(BaseHead):
         n, c, h, w = x.shape
         x = rearrange(x, 'n c h w -> n (c h w)')
         x = self.norm(x)
-        x = self.fc(x)        
+        x = self.fc(x)   
+        info = {}     
         
-        return x
+        return x, info
+            
+    def count_active_params(self):
+        return sum(p.numel() for p in self.fc.parameters())

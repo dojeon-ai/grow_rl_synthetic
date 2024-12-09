@@ -1,5 +1,4 @@
 import numpy as np
-import tqdm
 import copy
 import random
 import wandb
@@ -8,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from tqdm import tqdm
 from collections import deque
 from einops import rearrange
 from src.common.redo import *
@@ -44,6 +44,8 @@ class BaseTrainer():
         self.epoch = 0
         self.step = 0
 
+        print("Total head params:", sum(p.numel() for p in self.model.head.parameters()))
+
     def _build_optimizer(self, optimizer_type, optimizer_cfg):
         if optimizer_type == 'adamw':
             return optim.AdamW(self.model.parameters(), 
@@ -63,12 +65,12 @@ class BaseTrainer():
         self.task_idx = task_idx
         
         train_loader = self.train_loaders[task_idx]
-        num_epochs = int(cfg.base_epochs / cfg.input_data_ratios[task_idx])
-        test_every = int(cfg.base_test_every / cfg.input_data_ratios[task_idx])        
+        num_steps = cfg.train_steps_per_task
+        test_every = cfg.test_every
         
         scaler = torch.cuda.amp.GradScaler(enabled=cfg.use_amp)
         optimizer = self._build_optimizer(cfg.optimizer_type, cfg.optimizer)
-        cfg.scheduler.first_cycle_steps = len(train_loader) * num_epochs
+        cfg.scheduler.first_cycle_steps = num_steps
         lr_scheduler = self._build_scheduler(optimizer, cfg.scheduler)
                 
         test_logs = {}
@@ -79,124 +81,123 @@ class BaseTrainer():
         self.logger.update_log(**test_logs)
         self.logger.log_to_wandb(self.step)
         
-        # train        
-        for epoch in range(int(num_epochs)):          
-            for x_batch, y_batch in tqdm.tqdm(train_loader):   
-                # (1) early stop to avoid the loss of plasticity
-                # https://link.springer.com/chapter/10.1007/978-3-642-35289-8_5
-                max_epoch = int(cfg.early_stop.lmbda * num_epochs)
-                if (epoch > max_epoch) and ((task_idx+1) < cfg.num_tasks):
-                    train_logs = {}
-                    train_logs['lr'] = lr_scheduler.get_lr()[0]
+        # train
+        step = 0     
+        while step < num_steps:          
+            for x_batch, y_batch in tqdm(train_loader, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}'):   
+                self.model.train()
+                self.target_model.eval()
+
+                # forward            
+                x_batch = x_batch.to(self.device) # (n, c, h, w)
+                y_batch = y_batch.to(self.device) # (n,)
+                z = self.model.backbone(x_batch)                    
+                y_pred, info = self.model.head(z)  # (n, y)
+
+                # nll loss
+                loss_fn = nn.CrossEntropyLoss()
+                nll_loss = loss_fn(y_pred, y_batch)
+                acc1, acc5 = accuracy(y_pred, y_batch, topk=(1, 5))
+
+                # (2) self-distillation
+                if cfg.self_distill.lmbda > 0:
+                    z_t = self.target_model.backbone(x_batch)
+                    y_pred_t, info_t = self.target_model.head(z_t) # (n,y)
+                    soft_logits = F.log_softmax(y_pred / cfg.self_distill.temp, dim=1)
+                    soft_target = F.softmax(y_pred_t / cfg.self_distill.temp, dim=1)
                     
+                    distill_loss_fn = nn.KLDivLoss()
+                    distill_loss = distill_loss_fn(soft_logits, soft_target.detach())    
                 else:
-                    self.model.train()
-                    self.target_model.eval()
+                    distill_loss = torch.zeros(1, device=self.device)          
+                
+                # (3) spectral decoupling loss from gradient starvation
+                # https://arxiv.org/abs/2011.09468
+                spectral_loss = (y_pred ** 2).mean()
 
-                    # forward            
-                    x_batch = x_batch.to(self.device) # (n, c, h, w)
-                    y_batch = y_batch.to(self.device) # (n,)
-                    z = self.model.backbone(x_batch)                    
-                    y_pred = self.model.head(z)  # (n, y)
+                # (4) regenarative regularization loss
+                # https://arxiv.org/pdf/2308.11958.pdf
+                for param, init_param in zip(
+                    self.model.backbone.parameters(), self.init_model.backbone.parameters()):
+                    backbone_regen_loss = torch.norm(param - init_param, 2)
                     
-                    # nll loss
-                    loss_fn = nn.CrossEntropyLoss()
-                    nll_loss = loss_fn(y_pred, y_batch)
-                    acc1, acc5 = accuracy(y_pred, y_batch, topk=(1, 5))
-                    
-                    # (2) self-distillation
-                    if cfg.self_distill.lmbda > 0:
-                        z_t = self.target_model.backbone(x_batch)
-                        y_pred_t = self.target_model.head(z_t) # (n,y)
-                        soft_logits = F.log_softmax(y_pred / cfg.self_distill.temp, dim=1)
-                        soft_target = F.softmax(y_pred_t / cfg.self_distill.temp, dim=1)
+                for param, init_param in zip(
+                    self.model.head.parameters(), self.init_model.head.parameters()):
+                    head_regen_loss = torch.norm(param - init_param, 2)
+                
+                # loss
+                loss = (
+                    nll_loss 
+                    + cfg.spectral.lmbda * spectral_loss
+                    + cfg.regen.b_lmbda * backbone_regen_loss
+                    + cfg.regen.h_lmbda * head_regen_loss
+                    + cfg.self_distill.lmbda * distill_loss
+                )
+                if 'aux_loss' in info:
+                    loss += cfg.aux_lmbda * info['aux_loss']
+
+                # backward
+                scaler.scale(loss).backward()
+
+                # gradient clipping
+                # unscales the gradients of optimizer's assigned params in-place
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.clip_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                
+                # EMA (self-distill and Hare and Tortoise)
+                if cfg.ema > 0.0:
+                    for slow, fast in zip(self.target_model.parameters(), self.model.parameters()):
+                        slow.data = (cfg.ema) * slow.data + (1 - cfg.ema) * fast.data
                         
-                        distill_loss_fn = nn.KLDivLoss()
-                        distill_loss = distill_loss_fn(soft_logits, soft_target.detach())    
-                    else:
-                        distill_loss = torch.zeros(1, device=self.device)          
-                    
-                    # (3) spectral decoupling loss from gradient starvation
-                    # https://arxiv.org/abs/2011.09468
-                    spectral_loss = (y_pred ** 2).mean()
+                    for slow, fast in zip(self.target_model.buffers(), self.model.buffers()):
+                        slow.data = (cfg.ema)  * slow.data + (1 - cfg.ema) * fast.data  
 
-                    # (4) regenarative regularization loss
-                    # https://arxiv.org/pdf/2308.11958.pdf
-                    for param, init_param in zip(
-                        self.model.backbone.parameters(), self.init_model.backbone.parameters()):
-                        backbone_regen_loss = torch.norm(param - init_param, 2)
-                        
-                    for param, init_param in zip(
-                        self.model.head.parameters(), self.init_model.head.parameters()):
-                        head_regen_loss = torch.norm(param - init_param, 2)
-                    
-                    # loss
-                    loss = (nll_loss 
-                            + cfg.spectral.lmbda * spectral_loss
-                            + cfg.regen.b_lmbda * backbone_regen_loss
-                            + cfg.regen.h_lmbda * head_regen_loss
-                            + cfg.self_distill.lmbda * distill_loss
-                            )
-
-                    # backward
-                    scaler.scale(loss).backward()
-
-                    # gradient clipping
-                    # unscales the gradients of optimizer's assigned params in-place
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.clip_grad_norm)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    
-                    # EMA (self-distill and Hare and Tortoise)
-                    if cfg.ema > 0.0:
-                        for slow, fast in zip(self.target_model.parameters(), self.model.parameters()):
-                            slow.data = (cfg.ema) * slow.data + (1 - cfg.ema) * fast.data
-                            
-                        for slow, fast in zip(self.target_model.buffers(), self.model.buffers()):
-                            slow.data = (cfg.ema)  * slow.data + (1 - cfg.ema) * fast.data  
-
-                    # log        
-                    train_logs = {}                
-                    train_logs['train_loss'] = loss.item()
-                    train_logs['train_nll_loss'] = nll_loss.item()
-                    train_logs['train_spectral_loss'] = spectral_loss.item()
-                    train_logs['train_backbone_regen_loss'] = backbone_regen_loss.item()
-                    train_logs['train_head_regen_loss'] = head_regen_loss.item()
-                    train_logs['train_distill_loss'] = distill_loss.item()
-                    train_logs['train_acc1'] = acc1.item()
-                    train_logs['train_acc5'] = acc5.item()
-                    train_logs['lr'] = lr_scheduler.get_lr()[0]
-                    grad_norm_stats = get_grad_norm_stats(self.model)
-                    train_logs.update(grad_norm_stats)
+                # log        
+                train_logs = {}                
+                train_logs['train_loss'] = loss.item()
+                train_logs['train_nll_loss'] = nll_loss.item()
+                train_logs['train_spectral_loss'] = spectral_loss.item()
+                train_logs['train_backbone_regen_loss'] = backbone_regen_loss.item()
+                train_logs['train_head_regen_loss'] = head_regen_loss.item()
+                train_logs['train_distill_loss'] = distill_loss.item()
+                train_logs['train_acc1'] = acc1.item()
+                train_logs['train_acc5'] = acc5.item()
+                train_logs['lr'] = lr_scheduler.get_lr()[0]
+                for k,v in info.items():
+                    train_logs[k] = v.item()
+                grad_norm_stats = get_grad_norm_stats(self.model)
+                
+                train_logs.update(grad_norm_stats)
 
                 self.logger.update_log(**train_logs)
                 if self.step % cfg.log_every == 0:
+                    self.logger.update_log(**{'num_active_params':self.model.head.count_active_params()})
                     self.logger.log_to_wandb(self.step)
-                
+
+                if (step % test_every == 0) and (test_every != -1):
+                    self.model.eval()
+                    self.target_model.eval()
+                    test_logs = self.test()
+                    self.logger.update_log(**test_logs)
+                    self.logger.log_to_wandb(self.step)
+            
+                if (self.step+1) % cfg.intervene_every == 0:
+                    self.model.head.intervene()
+
                 lr_scheduler.step()
                 self.step += 1
+                step += 1
+                if step >= num_steps:
+                    break
                     
             self.epoch += 1
-            
-            # (6) Hare Tortoise
-            if (cfg.hare_tortoise.reset_every != -1) and (epoch % cfg.hare_tortoise.reset_every == 0):
-                for slow, fast in zip(self.target_model.parameters(), self.model.parameters()):
-                    fast.data = slow.data
-                    
-                for slow, fast in zip(self.target_model.buffers(), self.model.buffers()):
-                    fast.data = slow.data
 
             # log evaluation
-            test_logs = {}
-            test_logs['epoch'] = self.epoch
-            if (self.epoch % test_every == 0) and (test_every != -1):
-                self.model.eval()
-                self.target_model.eval()
-                test_logs.update(self.test())
-            self.logger.update_log(**test_logs)
+            self.logger.update_log(**{'epoch':self.epoch})
             self.logger.log_to_wandb(self.step)
-            
+
         # (5) Re-Initialization
         # (5.1) Shrink & Perturb: b_lmbda = alpha; h_lmbda = alpha
         # https://arxiv.org/abs/1910.08475
@@ -211,7 +212,7 @@ class BaseTrainer():
             param.data = (1-cfg.reinit.h_lmbda) * param.data + cfg.reinit.h_lmbda* init_param.data
 
     
-    def test(self) -> dict: 
+    def test(self) -> dict:
         cfg = self.cfg
                
         ####################
@@ -220,15 +221,15 @@ class BaseTrainer():
         acc1_list, acc5_list = [], []      
         acc1_t_list, acc5_t_list = [], []
         N = 0  
-        for x_batch, y_batch in tqdm.tqdm(self.test_loader):   
+        for x_batch, y_batch in tqdm(self.test_loader, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}'):   
             with torch.no_grad():                        
                 x_batch = x_batch.to(self.device) # (n, c, h, w)
                 y_batch = y_batch.to(self.device) # (n,)
                 z = self.model.backbone(x_batch)
-                y_pred = self.model.head(z)
+                y_pred, info = self.model.head(z)
                 
                 z_t = self.target_model.backbone(x_batch)
-                y_pred_t = self.target_model.head(z_t)
+                y_pred_t, info_t = self.target_model.head(z_t)
                 
                 loss_fn = nn.CrossEntropyLoss()
                 loss = loss_fn(y_pred, y_batch)
@@ -311,7 +312,7 @@ class BaseTrainer():
         self.model.enable_hooks()
         x_batch, y_batch = next(iter(train_loader))
         x_batch, y_batch = x_batch.to(self.device), y_batch.to(self.device)
-        y_pred = self.model(x_batch)
+        y_pred, info = self.model(x_batch)
         loss = loss_fn(y_pred, y_batch)
         loss.backward()
         activations = self.model.get_activations()
@@ -323,7 +324,7 @@ class BaseTrainer():
             num_zero_activations = torch.sum(activation == 0)
             total_activations = activation.numel()
             zero_ratio = num_zero_activations.float() / total_activations
-            zero_activation_ratios[layer_name + '_zero_activ_ratio'] = zero_ratio.item()        
+            zero_activation_ratios[f'zero_activ_ratio/{layer_name}'] = zero_ratio.item()        
 
         # feat.rank
         smooth_ranks = {}
@@ -333,15 +334,19 @@ class BaseTrainer():
             if len(activation.shape) == 2:
                 # compute singular values
                 S = torch.linalg.svdvals(activation)
-                smooth_rank, stable_rank = get_rank(S)
-                smooth_ranks[layer_name + '_smooth_rank'] = smooth_rank.item()
-                stable_ranks[layer_name + '_stable_rank'] = stable_rank.item()
+                try:
+                    smooth_rank, stable_rank = get_rank(S)
+                    smooth_rank = smooth_rank.item()
+                    stable_rank = stable_rank.item()
+                except Exception as e:
+                    smooth_rank, stable_rank = -1, -1
+                smooth_ranks[f'smooth_rank/{layer_name}'] = smooth_rank
+                stable_ranks[f'stable_rank/{layer_name}'] = stable_rank
 
         feature_logs = {}
         feature_logs.update(zero_activation_ratios)
         feature_logs.update(smooth_ranks)
         feature_logs.update(stable_ranks)
-        feature_logs = {}
 
         ####################
         # gradient analysis    

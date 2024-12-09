@@ -12,6 +12,7 @@ from src.models import *
 from src.trainers import *
 
 def run(args):    
+    X = torch.ones((1000,1000,), device='cuda:0')
     args = DotMap(args)
     config_path = args.config_path
     config_name = args.config_name
@@ -45,6 +46,8 @@ def run(args):
                             test_loader=test_loader,
                             logger=logger,
                             model=model)
+
+    del X
 
     # run
     for task_idx in range(cfg.num_tasks):

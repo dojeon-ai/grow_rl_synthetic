@@ -1,0 +1,2 @@
+type: 'nature'
+in_shape: ${dataset.in_shape}

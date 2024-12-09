@@ -7,7 +7,7 @@ label_noise_ratios: ${label_noise_ratios}
 buffer_size: 60000
 
 train:
-  root: '/home/hojoonlee/assets/MNIST/train'
+  root: '/home/donghukim/assets/MNIST/train'
   transforms:
     crop_type: 'none' # [none, center, random_resize, random_pad]
     scale: null
@@ -21,7 +21,7 @@ train:
   shuffle: true
 
 test:
-  root: '/home/hojoonlee/assets/MNIST/val' # './data/CIFAR10/val'
+  root: '/home/donghukim/assets/MNIST/val' # './data/CIFAR10/val'
   transforms:
     crop_type: 'none' # [center, random, none]
     scale: null

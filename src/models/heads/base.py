@@ -12,3 +12,10 @@ class BaseHead(nn.Module, metaclass=ABCMeta):
     @classmethod
     def get_name(cls):
         return cls.name
+
+    def intervene(self):
+        pass
+
+    def count_active_params(self):
+        """ Count 'active' parameters in head. """
+        raise NotImplementedError

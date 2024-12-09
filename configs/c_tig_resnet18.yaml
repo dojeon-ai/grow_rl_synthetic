@@ -7,13 +7,13 @@ dataset:
   train:
     transforms:
       crop_type: 'random_pad'
-      crop_size: 32   
+      crop_size: 64
       pad_size: 4
       horizontal_flip: true
 
 defaults:
 - _continual
-- dataset: cifar10
-- model: resnet18_gap
+- dataset: tig
+- model: resnet18_mlp
 - trainer: base
 - _self_

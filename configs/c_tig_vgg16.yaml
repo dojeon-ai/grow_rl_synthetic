@@ -2,8 +2,6 @@ trainer:
   optimizer:
     lr: 0.001
     weight_decay: 0.001
-  base_epochs: 10
-  base_test_every: 2
 
 dataset:
   train:
